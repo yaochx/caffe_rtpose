@@ -25,8 +25,8 @@
 #include <gflags/gflags.h>
 #include <google/protobuf/text_format.h>
 #include <opencv2/core/core.hpp>
-#include <opencv2/contrib/contrib.hpp>
 #include <opencv2/highgui/highgui.hpp>
+#include <opencv2/imgproc/imgproc.hpp>
 
 #include "caffe/blob.hpp"
 #include "caffe/common.hpp"
