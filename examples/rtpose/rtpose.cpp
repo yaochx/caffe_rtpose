@@ -25,24 +25,30 @@
 #include <gflags/gflags.h>
 #include <google/protobuf/text_format.h>
 #include <opencv2/core/core.hpp>
+// #include <opencv2/contrib/contrib.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
 
-#include "caffe/blob.hpp"
-#include "caffe/common.hpp"
-#include "caffe/layers/imresize_layer.hpp"
-#include "caffe/layers/nms_layer.hpp"
-#include "caffe/layers/switch_layer.hpp"
+#include "caffe/cpm/frame.h"
+#include "caffe/cpm/layers/imresize_layer.hpp"
+#include "caffe/cpm/layers/nms_layer.hpp"
 #include "caffe/net.hpp"
 #include "caffe/proto/caffe.pb.h"
 #include "caffe/util/db.hpp"
 #include "caffe/util/io.hpp"
 #include "caffe/util/benchmark.hpp"
 #include "caffe/util/blocking_queue.hpp"
-#include "caffe/util/render_functions.hpp"
+// #include "caffe/util/render_functions.hpp"
+// #include "caffe/blob.hpp"
+// #include "caffe/common.hpp"
+// #include "caffe/proto/caffe.pb.h"
+// #include "caffe/util/db.hpp"
+// #include "caffe/util/io.hpp"
+// #include "caffe/util/benchmark.hpp"
 
 #include "rtpose/modelDescriptor.h"
 #include "rtpose/modelDescriptorFactory.h"
+#include "rtpose/renderFunctions.h"
 
 // Flags (rtpose.bin --help)
 DEFINE_bool(fullscreen,             false,          "Run in fullscreen mode (press f during runtime to toggle)");
@@ -69,8 +75,8 @@ DEFINE_int32(num_scales,            1,              "Number of scales to average
 DEFINE_bool(no_display,             false,          "Do not open a display window.");
 
 // Global parameters
-int RESOLUTION_WIDTH;
-int RESOLUTION_HEIGHT;
+int DISPLAY_RESOLUTION_WIDTH;
+int DISPLAY_RESOLUTION_HEIGHT;
 int CAMERA_FRAME_WIDTH;
 int CAMERA_FRAME_HEIGHT;
 int NET_RESOLUTION_WIDTH;
@@ -114,7 +120,6 @@ struct Global {
             is_googly_eyes(0),
             current_frame(0),
             seek_to_frame(-1),
-            select_stage(-1),
             fps(0) {}
         bool is_fullscreen;
         bool is_video_paused;
@@ -122,7 +127,6 @@ struct Global {
         bool is_googly_eyes;
         int current_frame;
         int seek_to_frame;
-        int select_stage;
         double fps;
     };
     UIState uistate;
@@ -231,7 +235,7 @@ void warmup(int device_id) {
     LOG(INFO) << "Dry running...";
     net_copies[device_id].person_net->ForwardFrom(0);
     LOG(INFO) << "Success.";
-    cudaMalloc(&net_copies[device_id].canvas, RESOLUTION_WIDTH * RESOLUTION_HEIGHT * 3 * sizeof(float));
+    cudaMalloc(&net_copies[device_id].canvas, DISPLAY_RESOLUTION_WIDTH * DISPLAY_RESOLUTION_HEIGHT * 3 * sizeof(float));
     cudaMalloc(&net_copies[device_id].joints, MAX_NUM_PARTS*3*MAX_PEOPLE * sizeof(float) );
 }
 
@@ -273,12 +277,12 @@ void render(int gid, float *heatmaps /*GPU*/) {
 
     double tic = get_wall_time();
     if (net_copies[gid].up_model_descriptor->get_number_parts()==15) {
-        caffe::render_mpi_parts(net_copies[gid].canvas, RESOLUTION_WIDTH, RESOLUTION_HEIGHT, NET_RESOLUTION_WIDTH, NET_RESOLUTION_HEIGHT,
+        render_mpi_parts(net_copies[gid].canvas, DISPLAY_RESOLUTION_WIDTH, DISPLAY_RESOLUTION_HEIGHT, NET_RESOLUTION_WIDTH, NET_RESOLUTION_HEIGHT,
         heatmaps, BOX_SIZE, centers, poses, net_copies[gid].num_people, global.part_to_show);
     } else if (net_copies[gid].up_model_descriptor->get_number_parts()==18) {
         if (global.part_to_show-1<=net_copies[gid].up_model_descriptor->get_number_parts()) {
-            caffe::render_coco_parts(net_copies[gid].canvas,
-            RESOLUTION_WIDTH, RESOLUTION_HEIGHT,
+            render_coco_parts(net_copies[gid].canvas,
+            DISPLAY_RESOLUTION_WIDTH, DISPLAY_RESOLUTION_HEIGHT,
             NET_RESOLUTION_WIDTH, NET_RESOLUTION_HEIGHT,
             heatmaps, BOX_SIZE, centers, poses,
             net_copies[gid].num_people, global.part_to_show, global.uistate.is_googly_eyes);
@@ -291,7 +295,7 @@ void render(int gid, float *heatmaps /*GPU*/) {
                 aff_part = aff_part-2;
                 }
                 aff_part += 1+net_copies[gid].up_model_descriptor->get_number_parts();
-                caffe::render_coco_aff(net_copies[gid].canvas, RESOLUTION_WIDTH, RESOLUTION_HEIGHT, NET_RESOLUTION_WIDTH, NET_RESOLUTION_HEIGHT,
+                render_coco_aff(net_copies[gid].canvas, DISPLAY_RESOLUTION_WIDTH, DISPLAY_RESOLUTION_HEIGHT, NET_RESOLUTION_WIDTH, NET_RESOLUTION_HEIGHT,
                 heatmaps, BOX_SIZE, centers, poses, net_copies[gid].num_people, aff_part, num_parts_accum);
         }
     }
@@ -321,16 +325,16 @@ void* getFrameFromDir(void *i) {
         std::string filename = global.image_list[global.uistate.current_frame];
         image_uchar_orig = cv::imread(filename.c_str(), CV_LOAD_IMAGE_COLOR);
         double scale = 0;
-        if (image_uchar_orig.cols/(double)image_uchar_orig.rows>RESOLUTION_WIDTH/(double)RESOLUTION_HEIGHT) {
-            scale = RESOLUTION_WIDTH/(double)image_uchar_orig.cols;
+        if (image_uchar_orig.cols/(double)image_uchar_orig.rows>DISPLAY_RESOLUTION_WIDTH/(double)DISPLAY_RESOLUTION_HEIGHT) {
+            scale = DISPLAY_RESOLUTION_WIDTH/(double)image_uchar_orig.cols;
         } else {
-            scale = RESOLUTION_HEIGHT/(double)image_uchar_orig.rows;
+            scale = DISPLAY_RESOLUTION_HEIGHT/(double)image_uchar_orig.rows;
         }
         cv::Mat M = cv::Mat::eye(2,3,CV_64F);
         M.at<double>(0,0) = scale;
         M.at<double>(1,1) = scale;
         cv::warpAffine(image_uchar_orig, image_uchar, M,
-                             cv::Size(RESOLUTION_WIDTH, RESOLUTION_HEIGHT),
+                             cv::Size(DISPLAY_RESOLUTION_WIDTH, DISPLAY_RESOLUTION_HEIGHT),
                              CV_INTER_CUBIC,
                              cv::BORDER_CONSTANT, cv::Scalar(0,0,0));
         // resize(image_uchar, image_uchar, cv::Size(new_width, new_height), 0, 0, CV_INTER_CUBIC);
@@ -343,9 +347,9 @@ void* getFrameFromDir(void *i) {
         frame.ori_height = image_uchar_orig.rows;
         frame.index = global_counter++;
         frame.video_frame_number = global.uistate.current_frame;
-        frame.data_for_wrap = new unsigned char [RESOLUTION_HEIGHT * RESOLUTION_WIDTH * 3]; //fill after process
-        frame.data_for_mat = new float [RESOLUTION_HEIGHT * RESOLUTION_WIDTH * 3];
-        process_and_pad_image(frame.data_for_mat, image_uchar, RESOLUTION_WIDTH, RESOLUTION_HEIGHT, 0);
+        frame.data_for_wrap = new unsigned char [DISPLAY_RESOLUTION_HEIGHT * DISPLAY_RESOLUTION_WIDTH * 3]; //fill after process
+        frame.data_for_mat = new float [DISPLAY_RESOLUTION_HEIGHT * DISPLAY_RESOLUTION_WIDTH * 3];
+        process_and_pad_image(frame.data_for_mat, image_uchar, DISPLAY_RESOLUTION_WIDTH, DISPLAY_RESOLUTION_HEIGHT, 0);
 
         frame.scale = scale;
         //pad and transform to float
@@ -471,17 +475,17 @@ void* getFrameFromCam(void *i) {
         // to the imresize_layer. Confusingly, for the demo, there's an intermediate
         // display resolution to which the original image is resized.
         double scale = 0;
-        if (image_uchar_orig.cols/(double)image_uchar_orig.rows>RESOLUTION_WIDTH/(double)RESOLUTION_HEIGHT) {
-            scale = RESOLUTION_WIDTH/(double)image_uchar_orig.cols;
+        if (image_uchar_orig.cols/(double)image_uchar_orig.rows>DISPLAY_RESOLUTION_WIDTH/(double)DISPLAY_RESOLUTION_HEIGHT) {
+            scale = DISPLAY_RESOLUTION_WIDTH/(double)image_uchar_orig.cols;
         } else {
-            scale = RESOLUTION_HEIGHT/(double)image_uchar_orig.rows;
+            scale = DISPLAY_RESOLUTION_HEIGHT/(double)image_uchar_orig.rows;
         }
-        VLOG(4) << "Scale to RESOLUTION_WIDTH/HEIGHT: " << scale;
+        VLOG(4) << "Scale to DISPLAY_RESOLUTION_WIDTH/HEIGHT: " << scale;
         cv::Mat M = cv::Mat::eye(2,3,CV_64F);
         M.at<double>(0,0) = scale;
         M.at<double>(1,1) = scale;
         warpAffine(image_uchar_orig, image_uchar, M,
-                             cv::Size(RESOLUTION_WIDTH, RESOLUTION_HEIGHT),
+                             cv::Size(DISPLAY_RESOLUTION_WIDTH, DISPLAY_RESOLUTION_HEIGHT),
                              CV_INTER_CUBIC,
                              cv::BORDER_CONSTANT, cv::Scalar(0,0,0));
         // resize(image_uchar, image_uchar, Size(new_width, new_height), 0, 0, CV_INTER_CUBIC);
@@ -494,9 +498,9 @@ void* getFrameFromCam(void *i) {
         frame.scale = scale;
         frame.index = global_counter++;
         frame.video_frame_number = global.uistate.current_frame;
-        frame.data_for_wrap = new unsigned char [RESOLUTION_HEIGHT * RESOLUTION_WIDTH * 3]; //fill after process
-        frame.data_for_mat = new float [RESOLUTION_HEIGHT * RESOLUTION_WIDTH * 3];
-        process_and_pad_image(frame.data_for_mat, image_uchar, RESOLUTION_WIDTH, RESOLUTION_HEIGHT, 0);
+        frame.data_for_wrap = new unsigned char [DISPLAY_RESOLUTION_HEIGHT * DISPLAY_RESOLUTION_WIDTH * 3]; //fill after process
+        frame.data_for_mat = new float [DISPLAY_RESOLUTION_HEIGHT * DISPLAY_RESOLUTION_WIDTH * 3];
+        process_and_pad_image(frame.data_for_mat, image_uchar, DISPLAY_RESOLUTION_WIDTH, DISPLAY_RESOLUTION_HEIGHT, 0);
 
         //pad and transform to float
         int offset = 3 * NET_RESOLUTION_HEIGHT * NET_RESOLUTION_WIDTH;
@@ -732,8 +736,8 @@ int connectLimbs(
                 int idx = int(subset[i][j]);
                 if (idx) {
                     joints[cnt*num_parts*3 + j*3 +2] = peaks[idx];
-                    joints[cnt*num_parts*3 + j*3 +1] = peaks[idx-1] * RESOLUTION_HEIGHT/ (float)NET_RESOLUTION_HEIGHT;
-                    joints[cnt*num_parts*3 + j*3] = peaks[idx-2] * RESOLUTION_WIDTH/ (float)NET_RESOLUTION_WIDTH;
+                    joints[cnt*num_parts*3 + j*3 +1] = peaks[idx-1] * DISPLAY_RESOLUTION_HEIGHT/ (float)NET_RESOLUTION_HEIGHT;
+                    joints[cnt*num_parts*3 + j*3] = peaks[idx-2] * DISPLAY_RESOLUTION_WIDTH/ (float)NET_RESOLUTION_WIDTH;
                 }
                 else{
                     joints[cnt*num_parts*3 + j*3 +2] = 0;
@@ -1057,8 +1061,8 @@ int connectLimbsCOCO(
                 int idx = int(subset[i][j]);
                 if (idx) {
                     joints[cnt*num_parts*3 + j*3 +2] = peaks[idx];
-                    joints[cnt*num_parts*3 + j*3 +1] = peaks[idx-1]* RESOLUTION_HEIGHT/ (float)NET_RESOLUTION_HEIGHT;//(peaks[idx-1] - padh) * ratio_h;
-                    joints[cnt*num_parts*3 + j*3] = peaks[idx-2]* RESOLUTION_WIDTH/ (float)NET_RESOLUTION_WIDTH;//(peaks[idx-2] -padw) * ratio_w;
+                    joints[cnt*num_parts*3 + j*3 +1] = peaks[idx-1]* DISPLAY_RESOLUTION_HEIGHT/ (float)NET_RESOLUTION_HEIGHT;//(peaks[idx-1] - padh) * ratio_h;
+                    joints[cnt*num_parts*3 + j*3] = peaks[idx-2]* DISPLAY_RESOLUTION_WIDTH/ (float)NET_RESOLUTION_WIDTH;//(peaks[idx-2] -padw) * ratio_w;
                 }
                 else{
                     joints[cnt*num_parts*3 + j*3 +2] = 0;
@@ -1123,7 +1127,7 @@ void* processFrame(void *i) {
                 }
                 //double tic1  = get_wall_time();
 
-                cudaMemcpy(net_copies[tid].canvas, frame.data_for_mat, RESOLUTION_WIDTH * RESOLUTION_HEIGHT * 3 * sizeof(float), cudaMemcpyHostToDevice);
+                cudaMemcpy(net_copies[tid].canvas, frame.data_for_mat, DISPLAY_RESOLUTION_WIDTH * DISPLAY_RESOLUTION_HEIGHT * 3 * sizeof(float), cudaMemcpyHostToDevice);
 
                 frame_batch[0] = frame;
                 //LOG(ERROR)<< "Copy data " << index_array[n] << " to device " << tid << ", now size " << global.input_queue.size();
@@ -1140,22 +1144,6 @@ void* processFrame(void *i) {
         }
         if (valid_data == 0)
             continue;
-
-        if (global.uistate.select_stage>=0) {
-            caffe::SwitchLayer<float> *layer_ptr =
-                (caffe::SwitchLayer<float>*)net_copies[tid].person_net->layer_by_name("Switch_L1").get();
-                if (layer_ptr!=NULL) {
-                    LOG(INFO) << "Selecting stage " << global.uistate.select_stage;
-                    layer_ptr->SelectSwitch(global.uistate.select_stage);
-                    layer_ptr->switch_select_ = global.uistate.select_stage;
-                }
-                (caffe::SwitchLayer<float>*)net_copies[tid].person_net->layer_by_name("Switch_L2").get();
-                if (layer_ptr!=NULL) {
-                    LOG(INFO) << "Selecting stage " << global.uistate.select_stage;
-                    layer_ptr->SelectSwitch(global.uistate.select_stage);
-                    layer_ptr->switch_select_ = global.uistate.select_stage;
-                }
-        }
 
         nms_layer->SetThreshold(global.nms_threshold);
         net_copies[tid].person_net->ForwardFrom(0);
@@ -1201,7 +1189,7 @@ void* processFrame(void *i) {
                 }
 
 
-                cudaMemcpy(frame_batch[n].data_for_mat, net_copies[tid].canvas, RESOLUTION_HEIGHT * RESOLUTION_WIDTH * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+                cudaMemcpy(frame_batch[n].data_for_mat, net_copies[tid].canvas, DISPLAY_RESOLUTION_HEIGHT * DISPLAY_RESOLUTION_WIDTH * 3 * sizeof(float), cudaMemcpyDeviceToHost);
                 global.output_queue.push(frame_batch[n]);
             }
         }
@@ -1211,7 +1199,7 @@ void* processFrame(void *i) {
             for(int n = 0; n < valid_data; n++) {
                 frame_batch[n].numPeople = 0;
                 frame_batch[n].gpu_computed_time = get_wall_time();
-                cudaMemcpy(frame_batch[n].data_for_mat, net_copies[tid].canvas, RESOLUTION_HEIGHT * RESOLUTION_WIDTH * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+                cudaMemcpy(frame_batch[n].data_for_mat, net_copies[tid].canvas, DISPLAY_RESOLUTION_HEIGHT * DISPLAY_RESOLUTION_WIDTH * 3 * sizeof(float), cudaMemcpyDeviceToHost);
                 global.output_queue.push(frame_batch[n]);
             }
         }
@@ -1299,13 +1287,13 @@ void* postProcessFrame(void *i) {
         frame.postprocesse_begin_time = get_wall_time();
 
         //Mat visualize(NET_RESOLUTION_HEIGHT, NET_RESOLUTION_WIDTH, CV_8UC3);
-        int offset = RESOLUTION_WIDTH * RESOLUTION_HEIGHT;
+        int offset = DISPLAY_RESOLUTION_WIDTH * DISPLAY_RESOLUTION_HEIGHT;
         for(int c = 0; c < 3; c++) {
-            for(int i = 0; i < RESOLUTION_HEIGHT; i++) {
-                for(int j = 0; j < RESOLUTION_WIDTH; j++) {
-                    int value = int(frame.data_for_mat[c*offset + i*RESOLUTION_WIDTH + j] + 0.5);
+            for(int i = 0; i < DISPLAY_RESOLUTION_HEIGHT; i++) {
+                for(int j = 0; j < DISPLAY_RESOLUTION_WIDTH; j++) {
+                    int value = int(frame.data_for_mat[c*offset + i*DISPLAY_RESOLUTION_WIDTH + j] + 0.5);
                     value = value<0 ? 0 : (value > 255 ? 255 : value);
-                    frame.data_for_wrap[3*(i*RESOLUTION_WIDTH + j) + c] = (unsigned char)(value);
+                    frame.data_for_wrap[3*(i*DISPLAY_RESOLUTION_WIDTH + j) + c] = (unsigned char)(value);
                 }
             }
         }
@@ -1329,7 +1317,7 @@ void* displayFrame(void *i) { //single thread
 
         frame = global.output_queue_ordered.pop();
         double tic = get_wall_time();
-        cv::Mat wrap_frame(RESOLUTION_HEIGHT, RESOLUTION_WIDTH, CV_8UC3, frame.data_for_wrap);
+        cv::Mat wrap_frame(DISPLAY_RESOLUTION_HEIGHT, DISPLAY_RESOLUTION_WIDTH, CV_8UC3, frame.data_for_wrap);
 
         if (FLAGS_write_frames.empty()) {
             snprintf(tmp_str, 256, "%4.1f fps", FPS);
@@ -1341,9 +1329,9 @@ void* displayFrame(void *i) { //single thread
             cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(255,150,150), 1);
 
         snprintf(tmp_str, 256, "%4d", frame.numPeople);
-        cv::putText(wrap_frame, tmp_str, cv::Point(RESOLUTION_WIDTH-100+2, 35+2),
+        cv::putText(wrap_frame, tmp_str, cv::Point(DISPLAY_RESOLUTION_WIDTH-100+2, 35+2),
             cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(0,0,0), 2);
-        cv::putText(wrap_frame, tmp_str, cv::Point(RESOLUTION_WIDTH-100, 35),
+        cv::putText(wrap_frame, tmp_str, cv::Point(DISPLAY_RESOLUTION_WIDTH-100, 35),
             cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(150,150,255), 2);
         }
         if (global.part_to_show!=0) {
@@ -1361,7 +1349,7 @@ void* displayFrame(void *i) { //single thread
                     snprintf(tmp_str, 256, "%10s", conn.c_str());
                 }
             }
-            cv::putText(wrap_frame, tmp_str, cv::Point(RESOLUTION_WIDTH-175+1, 55+1),
+            cv::putText(wrap_frame, tmp_str, cv::Point(DISPLAY_RESOLUTION_WIDTH-175+1, 55+1),
                 cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255,255,255), 1);
         }
         if (!FLAGS_video.empty() && FLAGS_write_frames.empty()) {
@@ -1491,7 +1479,7 @@ int rtcpm() {
             cv::setWindowProperty("video", CV_WND_PROP_FULLSCREEN, CV_WINDOW_FULLSCREEN);
             global.uistate.is_fullscreen = true;
         } else {
-            cv::resizeWindow("video", RESOLUTION_WIDTH, RESOLUTION_HEIGHT);
+            cv::resizeWindow("video", DISPLAY_RESOLUTION_WIDTH, DISPLAY_RESOLUTION_HEIGHT);
             cv::setWindowProperty("video", CV_WND_PROP_FULLSCREEN, CV_WINDOW_NORMAL);
             global.uistate.is_fullscreen = false;
         }
@@ -1561,7 +1549,6 @@ int rtcpm() {
 
 bool handleKey(int c) {
     const std::string key2part = "0123456789qwertyuiopas";
-    const std::string key2stage = "zxcvbn";
     VLOG(4) << "key: " << (char)c << " code: " << c;
     if (c>=65505) {
         global.uistate.is_shift_down = true;
@@ -1611,7 +1598,7 @@ bool handleKey(int c) {
         } else {
             cv::namedWindow("video", CV_WINDOW_NORMAL | CV_WINDOW_KEEPRATIO);
             cv::setWindowProperty("video", CV_WND_PROP_FULLSCREEN, CV_WINDOW_NORMAL);
-            cv::resizeWindow("video", RESOLUTION_WIDTH, RESOLUTION_HEIGHT);
+            cv::resizeWindow("video", DISPLAY_RESOLUTION_WIDTH, DISPLAY_RESOLUTION_HEIGHT);
             global.uistate.is_fullscreen = false;
         }
     }
@@ -1679,36 +1666,29 @@ bool handleKey(int c) {
         LOG(INFO) << "p2s: " << global.part_to_show;
     }
 
-    int stage = -1;
-    ind = key2stage.find(c);
-    if (ind!=std::string::npos) {
-        stage = ind;
-        global.uistate.select_stage = stage;
-    }
-
     return true;
 }
 
 // The global parameters must be assign after the main has started, not statically before. Otherwise, they will take the default values, not the user-introduced values.
 int setGlobalParametersFromFlags() {
-    int nRead = sscanf(FLAGS_resolution.c_str(), "%dx%d", &RESOLUTION_WIDTH, &RESOLUTION_HEIGHT);
+    int nRead = sscanf(FLAGS_resolution.c_str(), "%dx%d", &DISPLAY_RESOLUTION_WIDTH, &DISPLAY_RESOLUTION_HEIGHT);
     CHECK_EQ(nRead,2) << "Error, resolution format (" <<  FLAGS_resolution << ") invalid, should be e.g., 960x540 ";
-    if (RESOLUTION_WIDTH==-1 && !FLAGS_video.empty()) {
+    if (DISPLAY_RESOLUTION_WIDTH==-1 && !FLAGS_video.empty()) {
         cv::VideoCapture cap;
         CHECK(cap.open(FLAGS_video)) << "Couldn't open video " << FLAGS_video;
-        RESOLUTION_WIDTH = cap.get(CV_CAP_PROP_FRAME_WIDTH);
-        RESOLUTION_HEIGHT = cap.get(CV_CAP_PROP_FRAME_HEIGHT);
-        LOG(INFO) << "Setting display resolution from video: " << RESOLUTION_WIDTH << "x" << RESOLUTION_HEIGHT;
-    } else if (RESOLUTION_WIDTH==-1 && !FLAGS_image_dir.empty()) {
+        DISPLAY_RESOLUTION_WIDTH = cap.get(CV_CAP_PROP_FRAME_WIDTH);
+        DISPLAY_RESOLUTION_HEIGHT = cap.get(CV_CAP_PROP_FRAME_HEIGHT);
+        LOG(INFO) << "Setting display resolution from video: " << DISPLAY_RESOLUTION_WIDTH << "x" << DISPLAY_RESOLUTION_HEIGHT;
+    } else if (DISPLAY_RESOLUTION_WIDTH==-1 && !FLAGS_image_dir.empty()) {
         cv::Mat image_uchar_orig = cv::imread(global.image_list[0].c_str(), CV_LOAD_IMAGE_COLOR);
-        RESOLUTION_WIDTH = image_uchar_orig.cols;
-        RESOLUTION_HEIGHT = image_uchar_orig.rows;
-        LOG(INFO) << "Setting display resolution from first image: " << RESOLUTION_WIDTH << "x" << RESOLUTION_HEIGHT;
-    } else if (RESOLUTION_WIDTH==-1) {
-        LOG(ERROR) << "Invalid resolution without video/images: " << RESOLUTION_WIDTH << "x" << RESOLUTION_HEIGHT;
+        DISPLAY_RESOLUTION_WIDTH = image_uchar_orig.cols;
+        DISPLAY_RESOLUTION_HEIGHT = image_uchar_orig.rows;
+        LOG(INFO) << "Setting display resolution from first image: " << DISPLAY_RESOLUTION_WIDTH << "x" << DISPLAY_RESOLUTION_HEIGHT;
+    } else if (DISPLAY_RESOLUTION_WIDTH==-1) {
+        LOG(ERROR) << "Invalid resolution without video/images: " << DISPLAY_RESOLUTION_WIDTH << "x" << DISPLAY_RESOLUTION_HEIGHT;
         exit(1);
     } else {
-        LOG(INFO) << "Display resolution: " << RESOLUTION_WIDTH << "x" << RESOLUTION_HEIGHT;
+        LOG(INFO) << "Display resolution: " << DISPLAY_RESOLUTION_WIDTH << "x" << DISPLAY_RESOLUTION_HEIGHT;
     }
     nRead = sscanf(FLAGS_camera_resolution.c_str(), "%dx%d", &CAMERA_FRAME_WIDTH, &CAMERA_FRAME_HEIGHT);
     CHECK_EQ(nRead,2) << "Error, camera resolution format (" <<  FLAGS_camera_resolution << ") invalid, should be e.g., 1280x720";

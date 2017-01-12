@@ -48,7 +48,8 @@ COMMON_FLAGS += -DCAFFE_VERSION=$(DYNAMIC_VERSION_MAJOR).$(DYNAMIC_VERSION_MINOR
 # CXX_SRCS := $(shell find src/$(PROJECT) ! -name "test_*.cpp" -name "*.cpp")
 CXX_SRCS := $(shell find src ! -name "test_*.cpp" -name "*.cpp")
 # CU_SRCS are the cuda source files
-CU_SRCS := $(shell find src/$(PROJECT) ! -name "test_*.cu" -name "*.cu")
+# CU_SRCS := $(shell find src/$(PROJECT) ! -name "test_*.cu" -name "*.cu")
+CU_SRCS := $(shell find src ! -name "test_*.cu" -name "*.cu")
 # TEST_SRCS are the test source files
 TEST_MAIN_SRC := src/$(PROJECT)/test/test_caffe_main.cpp
 TEST_SRCS := $(shell find src/$(PROJECT) -name "test_*.cpp")
@@ -112,7 +113,6 @@ PROTO_GEN_PY := $(foreach file,${PROTO_SRCS:.proto=_pb2.py}, \
 # These objects will be linked into the final shared library, so we
 # exclude the tool, example, and test objects.
 CXX_OBJS := $(addprefix $(BUILD_DIR)/, ${CXX_SRCS:.cpp=.o})
-# $(error ${CXX_SRCS:.cpp=.o})
 CU_OBJS := $(addprefix $(BUILD_DIR)/cuda/, ${CU_SRCS:.cu=.o})
 PROTO_OBJS := ${PROTO_GEN_CC:.cc=.o}
 OBJS := $(PROTO_OBJS) $(CXX_OBJS) $(CU_OBJS)
@@ -197,8 +197,8 @@ ifeq ($(USE_OPENCV), 1)
 	LIBRARIES += opencv_core opencv_highgui opencv_imgproc
 
 	ifeq ($(OPENCV_VERSION), 3)
-		LIBRARIES += opencv_video opencv_videoio opencv_imgcodecs 
-    else
+		LIBRARIES += opencv_imgcodecs opencv_videoio
+	else
 		LIBRARIES += opencv_contrib
 	endif
 
@@ -324,7 +324,6 @@ ifeq ($(DEBUG), 1)
 	NVCCFLAGS += -G
 else
 	COMMON_FLAGS += -DNDEBUG -O3
-	#NVCCFLAGS += "--ptxas-options=-v"
 endif
 
 # cuDNN acceleration configuration.
