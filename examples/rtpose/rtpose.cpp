@@ -58,6 +58,7 @@ DEFINE_bool(no_frame_drops,         false,          "Dont drop frames.");
 DEFINE_string(write_json,           "",             "Write joint data with json format as prefix%06d.json");
 DEFINE_int32(camera,                0,              "The camera index for VideoCapture.");
 DEFINE_string(video,                "",             "Use a video file instead of the camera.");
+DEFINE_bool(transpose,              false,          "Transpose the camera input.");
 DEFINE_string(image_dir,            "",             "Process a directory of images.");
 DEFINE_int32(start_frame,           0,              "Skip to frame # of video");
 DEFINE_string(caffemodel, "model/coco/pose_iter_440000.caffemodel", "Caffe model.");
@@ -65,7 +66,8 @@ DEFINE_string(caffeproto, "model/coco/pose_deploy_linevec.prototxt", "Caffe depl
 // DEFINE_string(caffemodel, "model/mpi/pose_iter_160000.caffemodel", "Caffe model.");
 // DEFINE_string(caffeproto, "model/mpi/pose_deploy_linevec.prototxt", "Caffe deploy prototxt.");
 DEFINE_string(resolution,           "1280x720",     "The image resolution (display).");
-DEFINE_string(net_resolution,       "656x368",      "Multiples of 16.");
+// DEFINE_string(net_resolution,       "656x368",      "Multiples of 16.");
+DEFINE_string(net_resolution,       "384x192",      "Multiples of 16.");
 DEFINE_string(camera_resolution,    "1280x720",     "Size of the camera frames to ask for.");
 DEFINE_int32(start_device,          0,              "GPU device start number.");
 DEFINE_int32(num_gpu,               1,              "The number of GPU devices to use.");
@@ -432,6 +434,9 @@ void* getFrameFromCam(void *i) {
             }
         }
         cap >> image_uchar_orig;
+        if (FLAGS_transpose) {
+            cv::transpose(image_uchar_orig, image_uchar_orig);
+        }
         // Keep a count of how many frames we've seen in the video
         if (!FLAGS_video.empty()) {
             if (global.uistate.seek_to_frame!=-1) {
@@ -1368,12 +1373,20 @@ void* displayFrame(void *i) { //single thread
             compression_params.push_back(CV_IMWRITE_JPEG_QUALITY);
             compression_params.push_back(98);
             char fname[256];
-            if (FLAGS_image_dir.empty()) {
-                sprintf(fname, "%s/frame%06d.jpg", FLAGS_write_frames.c_str(), frame.video_frame_number);
-            } else {
+            boost::filesystem::path dir(FLAGS_write_frames);
+            if (boost::filesystem::is_directory(dir)) {         
+                static int num = 0;
+                std::cout << frame.video_frame_number << std::endl;
+                // sprintf(fname, "%s/frame%06d.jpg", FLAGS_write_frames.c_str(), frame.video_frame_number);
+                sprintf(fname, "%s/frame%06d.jpg", FLAGS_write_frames.c_str(), num);
+                num++;
+            } else if (!FLAGS_image_dir.empty()) {
                 boost::filesystem::path p(global.image_list[frame.video_frame_number]);
                 std::string rawname = p.stem().string();
-                sprintf(fname, "%s/%s.jpg", FLAGS_write_frames.c_str(), rawname.c_str());
+                sprintf(fname, "%s/%s.jpg", FLAGS_image_dir.c_str(), rawname.c_str());
+            } else {
+                LOG(ERROR) << "write dir is configured incorrectly";
+                exit(1);
             }
 
             cv::imwrite(fname, wrap_frame, compression_params);
@@ -1590,7 +1603,7 @@ bool handleKey(int c) {
         }
     }
     if (c=='f') {
-        if (!global.uistate.is_fullscreen) {
+        if (!FLAGS_transpose && !global.uistate.is_fullscreen) {
             cv::namedWindow("video", CV_WINDOW_NORMAL | CV_WINDOW_KEEPRATIO);
             cv::resizeWindow("video", 1920, 1080);
             cv::setWindowProperty("video", CV_WND_PROP_FULLSCREEN, CV_WINDOW_FULLSCREEN);

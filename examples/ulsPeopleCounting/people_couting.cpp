@@ -61,13 +61,13 @@ DEFINE_string(video,                "",             "Use a video file instead of
 DEFINE_bool(transpose,              false,          "Transpose the camera input.");
 DEFINE_string(image_dir,            "",             "Process a directory of images.");
 DEFINE_int32(start_frame,           0,              "Skip to frame # of video");
-DEFINE_string(caffemodel, "model/coco/pose_iter_440000.caffemodel", "Caffe model.");
-DEFINE_string(caffeproto, "model/coco/pose_deploy_linevec.prototxt", "Caffe deploy prototxt.");
-// DEFINE_string(caffemodel, "model/mpi/pose_iter_160000.caffemodel", "Caffe model.");
-// DEFINE_string(caffeproto, "model/mpi/pose_deploy_linevec.prototxt", "Caffe deploy prototxt.");
+// DEFINE_string(caffemodel, "model/coco/pose_iter_440000.caffemodel", "Caffe model.");
+// DEFINE_string(caffeproto, "model/coco/pose_deploy_linevec.prototxt", "Caffe deploy prototxt.");
+DEFINE_string(caffemodel, "model/coco/pose_iter_160000.caffemodel", "Caffe model.");
+DEFINE_string(caffeproto, "model/mpi/pose_deploy_linevec.prototxt", "Caffe deploy prototxt.");
 DEFINE_string(resolution,           "1280x720",     "The image resolution (display).");
 // DEFINE_string(net_resolution,       "656x368",      "Multiples of 16.");
-DEFINE_string(net_resolution,       "384x192",      "Multiples of 16.");
+DEFINE_string(net_resolution,       "256x144",      "Multiples of 16.");
 DEFINE_string(camera_resolution,    "1280x720",     "Size of the camera frames to ask for.");
 DEFINE_int32(start_device,          0,              "GPU device start number.");
 DEFINE_int32(num_gpu,               1,              "The number of GPU devices to use.");
@@ -1766,6 +1766,330 @@ int readImageDirIfFlagEnabled()
     return 0;
 }
 
+
+void* processFrame_2(void *i) {
+    cv::VideoCapture cap;
+    CHECK(cap.open(FLAGS_camera)) << "Couldn't open camera " << FLAGS_camera;
+    cap.set(CV_CAP_PROP_FRAME_WIDTH,CAMERA_FRAME_WIDTH);
+    cap.set(CV_CAP_PROP_FRAME_HEIGHT,CAMERA_FRAME_HEIGHT);
+
+    int global_counter = 1;
+    int frame_counter = 0;
+    cv::Mat image_uchar;
+    cv::Mat image_uchar_orig;
+    cv::Mat image_uchar_prev;
+
+    int tid = *((int *) i);
+    warmup(tid);
+    LOG(INFO) << "GPU " << tid << " is ready";
+
+    int offset = NET_RESOLUTION_WIDTH * NET_RESOLUTION_HEIGHT * 3;
+    //bool empty = false;
+
+    Frame frame_batch[BATCH_SIZE];
+
+    std::vector< std::vector<double>> subset;
+    std::vector< std::vector< std::vector<double> > > connection;
+
+    const boost::shared_ptr<caffe::Blob<float>> heatmap_blob = net_copies[tid].person_net->blob_by_name("resized_map");
+    const boost::shared_ptr<caffe::Blob<float>> joints_blob = net_copies[tid].person_net->blob_by_name("joints");
+
+    caffe::NmsLayer<float> *nms_layer = (caffe::NmsLayer<float>*)net_copies[tid].person_net->layer_by_name("nms").get();
+
+    //while(!empty) {
+    while(1) {
+        cap >> image_uchar_orig;
+        if (FLAGS_transpose) {
+            cv::transpose(image_uchar_orig, image_uchar_orig);
+        }
+        
+        // From camera, just increase counter.
+        image_uchar_prev = image_uchar_orig;
+        frame_counter++;
+
+        // TODO: The entire scaling code should be rewritten and better matched
+        // to the imresize_layer. Confusingly, for the demo, there's an intermediate
+        // display resolution to which the original image is resized.
+        double scale = 0;
+        if (image_uchar_orig.cols/(double)image_uchar_orig.rows>DISPLAY_RESOLUTION_WIDTH/(double)DISPLAY_RESOLUTION_HEIGHT) {
+            scale = DISPLAY_RESOLUTION_WIDTH/(double)image_uchar_orig.cols;
+        } else {
+            scale = DISPLAY_RESOLUTION_HEIGHT/(double)image_uchar_orig.rows;
+        }
+        std::cout << "Scale to DISPLAY_RESOLUTION_WIDTH/HEIGHT: " << scale << std::endl;
+        cv::Mat M = cv::Mat::eye(2,3,CV_64F);
+        M.at<double>(0,0) = scale;
+        M.at<double>(1,1) = scale;
+        warpAffine(image_uchar_orig, image_uchar, M,
+                             cv::Size(DISPLAY_RESOLUTION_WIDTH, DISPLAY_RESOLUTION_HEIGHT),
+                             CV_INTER_CUBIC,
+                             cv::BORDER_CONSTANT, cv::Scalar(0,0,0));
+        // resize(image_uchar, image_uchar, Size(new_width, new_height), 0, 0, CV_INTER_CUBIC);
+        image_uchar_prev = image_uchar_orig;
+
+        if ( image_uchar.empty() )
+            continue;
+
+        Frame frame;
+        frame.gpu_fetched_time = get_wall_time();
+        frame.scale = scale;
+        frame.index = global_counter++;
+        frame.video_frame_number = global.uistate.current_frame;
+        frame.data_for_wrap = new unsigned char [DISPLAY_RESOLUTION_HEIGHT * DISPLAY_RESOLUTION_WIDTH * 3]; //fill after process
+        frame.data_for_mat = new float [DISPLAY_RESOLUTION_HEIGHT * DISPLAY_RESOLUTION_WIDTH * 3];
+        process_and_pad_image(frame.data_for_mat, image_uchar, DISPLAY_RESOLUTION_WIDTH, DISPLAY_RESOLUTION_HEIGHT, 0);
+
+        //pad and transform to float
+        frame.data = new float [BATCH_SIZE * offset];
+        int target_width;
+        int target_height;
+        cv::Mat image_temp;
+        for(int i=0; i < BATCH_SIZE; i++) {
+            float scale = START_SCALE - i*SCALE_GAP;
+            target_width = 16 * ceil(NET_RESOLUTION_WIDTH * scale /16);
+            target_height = 16 * ceil(NET_RESOLUTION_HEIGHT * scale /16);
+
+            CHECK_LE(target_width, NET_RESOLUTION_WIDTH);
+            CHECK_LE(target_height, NET_RESOLUTION_HEIGHT);
+
+            cv::resize(image_uchar, image_temp, cv::Size(target_width, target_height), 0, 0, CV_INTER_AREA);
+            process_and_pad_image(frame.data + i * offset, image_temp, NET_RESOLUTION_WIDTH, NET_RESOLUTION_HEIGHT, 1);
+        }
+        frame.commit_time = get_wall_time();
+        frame.preprocessed_time = get_wall_time();        
+
+        std::cout << "Read Camera Index: " << frame.index << std::endl;
+
+        cudaMemcpy(net_copies[tid].canvas, frame.data_for_mat, DISPLAY_RESOLUTION_WIDTH * DISPLAY_RESOLUTION_HEIGHT * 3 * sizeof(float), cudaMemcpyHostToDevice);
+
+        //LOG(ERROR)<< "Copy data " << index_array[n] << " to device " << tid << ", now size " << global.input_queue.size();
+        float* pointer = net_copies[tid].person_net->blobs()[0]->mutable_gpu_data();
+
+        cudaMemcpy(pointer + 0 * offset, frame.data, BATCH_SIZE * offset * sizeof(float), cudaMemcpyHostToDevice);
+
+
+        nms_layer->SetThreshold(global.nms_threshold);
+        net_copies[tid].person_net->ForwardFrom(0);
+        std::cout << "CNN time " << (get_wall_time()-frame.gpu_fetched_time)*1000.0 << " ms." << std::endl;
+
+        float* heatmap_pointer = heatmap_blob->mutable_cpu_data();
+        const float* peaks = joints_blob->mutable_cpu_data();
+
+        float joints[MAX_NUM_PARTS*3*MAX_PEOPLE]; //10*15*3
+
+        int cnt = 0;
+        // CHECK_EQ(net_copies[tid].nms_num_parts, 15);
+        double tic = get_wall_time();
+        const int num_parts = net_copies[tid].nms_num_parts;
+        if (net_copies[tid].nms_num_parts==15) {
+            cnt = connectLimbs(subset, connection,
+                                                 heatmap_pointer, peaks,
+                                                 net_copies[tid].nms_max_peaks, joints, net_copies[tid].up_model_descriptor.get());
+        } else {
+            cnt = connectLimbsCOCO(subset, connection,
+                                                 heatmap_pointer, peaks,
+                                                 net_copies[tid].nms_max_peaks, joints, net_copies[tid].up_model_descriptor.get());
+        }
+
+        std::cout << "CNT: " << cnt << " Connect time " << (get_wall_time()-tic)*1000.0 << " ms." << std::endl;
+        net_copies[tid].num_people[0] = cnt;
+        std::cout << "num_people[i] = " << cnt << std::endl;
+
+
+        cudaMemcpy(net_copies[tid].joints, joints,
+            MAX_NUM_PARTS*3*MAX_PEOPLE * sizeof(float),
+            cudaMemcpyHostToDevice);
+
+        if (subset.size() != 0) {
+            //LOG(ERROR) << "Rendering";
+            render(tid, heatmap_pointer); //only support batch size = 1!!!!
+            for(int n = 0; n < 1; n++) {
+                frame_batch[n].numPeople = net_copies[tid].num_people[n];
+                frame_batch[n].gpu_computed_time = get_wall_time();
+                frame_batch[n].joints = boost::shared_ptr<float[]>(new float[frame_batch[n].numPeople*MAX_NUM_PARTS*3]);
+                for (int ij=0;ij<frame_batch[n].numPeople*num_parts*3;ij++) {
+                    frame_batch[n].joints[ij] = joints[ij];
+                }
+
+                cudaMemcpy(frame.data_for_mat, net_copies[tid].canvas, DISPLAY_RESOLUTION_HEIGHT * DISPLAY_RESOLUTION_WIDTH * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+            }
+        }
+        else {
+            render(tid, heatmap_pointer);
+            //frame_batch[n].data should revert to 0-255
+            for(int n = 0; n < 1; n++) {
+                frame_batch[n].numPeople = 0;
+                frame_batch[n].gpu_computed_time = get_wall_time();
+                cudaMemcpy(frame.data_for_mat, net_copies[tid].canvas, DISPLAY_RESOLUTION_HEIGHT * DISPLAY_RESOLUTION_WIDTH * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+            }
+        }
+
+        frame.postprocesse_begin_time = get_wall_time();
+
+        //Mat visualize(NET_RESOLUTION_HEIGHT, NET_RESOLUTION_WIDTH, CV_8UC3);
+        int offset = DISPLAY_RESOLUTION_WIDTH * DISPLAY_RESOLUTION_HEIGHT;
+        for(int c = 0; c < 3; c++) {
+            for(int i = 0; i < DISPLAY_RESOLUTION_HEIGHT; i++) {
+                for(int j = 0; j < DISPLAY_RESOLUTION_WIDTH; j++) {
+                    int value = int(frame.data_for_mat[c*offset + i*DISPLAY_RESOLUTION_WIDTH + j] + 0.5);
+                    value = value<0 ? 0 : (value > 255 ? 255 : value);
+                    frame.data_for_wrap[3*(i*DISPLAY_RESOLUTION_WIDTH + j) + c] = (unsigned char)(value);
+                }
+            }
+        }
+        frame.postprocesse_end_time = get_wall_time();
+        std::cout << "Post Process Time: " << 1000.0 * (frame.postprocesse_end_time - frame.postprocesse_begin_time) << "ms" << std::endl;
+
+        int counter = 1;
+        float FPS = 0;
+        char tmp_str[256];
+        double last_time = get_wall_time();
+        double this_time;
+        tic = get_wall_time();
+        cv::Mat wrap_frame(DISPLAY_RESOLUTION_HEIGHT, DISPLAY_RESOLUTION_WIDTH, CV_8UC3, frame.data_for_wrap);
+
+        if (FLAGS_write_frames.empty()) {
+            snprintf(tmp_str, 256, "%4.1f fps", FPS);
+        } else {
+            snprintf(tmp_str, 256, "%4.2f s/gpu", FLAGS_num_gpu*1.0/FPS);
+        }
+        cv::putText(wrap_frame, tmp_str, cv::Point(25,35),
+            cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(255,150,150), 1);
+
+        snprintf(tmp_str, 256, "%4d", frame.numPeople);
+        cv::putText(wrap_frame, tmp_str, cv::Point(DISPLAY_RESOLUTION_WIDTH-100+2, 35+2),
+            cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(0,0,0), 2);
+        cv::putText(wrap_frame, tmp_str, cv::Point(DISPLAY_RESOLUTION_WIDTH-100, 35),
+            cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(150,150,255), 2);
+        if (global.part_to_show!=0) {
+            if (global.part_to_show-1<=net_copies.at(0).up_model_descriptor->get_number_parts()) {
+                snprintf(tmp_str, 256, "%10s", net_copies.at(0).up_model_descriptor->get_part_name(global.part_to_show-1).c_str());
+            } else {
+                int aff_part = ((global.part_to_show-1)-net_copies.at(0).up_model_descriptor->get_number_parts()-1)*2;
+                if (aff_part==0) {
+                    snprintf(tmp_str, 256, "%10s", "PAFs");
+                } else {
+                    aff_part = aff_part-2;
+                    aff_part += 1+net_copies.at(0).up_model_descriptor->get_number_parts();
+                    std::string uvname = net_copies.at(0).up_model_descriptor->get_part_name(aff_part);
+                    std::string conn = uvname.substr(0, uvname.find("("));
+                    snprintf(tmp_str, 256, "%10s", conn.c_str());
+                }
+            }
+            cv::putText(wrap_frame, tmp_str, cv::Point(DISPLAY_RESOLUTION_WIDTH-175+1, 55+1),
+                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255,255,255), 1);
+        }
+        if (!FLAGS_video.empty() && FLAGS_write_frames.empty()) {
+            snprintf(tmp_str, 256, "Frame %6d", global.uistate.current_frame);
+            // cv::putText(wrap_frame, tmp_str, cv::Point(27,37),
+            //     cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0,0,0), 2);
+            cv::putText(wrap_frame, tmp_str, cv::Point(25,55),
+                cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(255,255,255), 1);
+        }
+
+        if (!FLAGS_no_display) {
+            cv::imshow("video", wrap_frame);
+        }
+        if (!FLAGS_write_frames.empty()) {
+            std::vector<int> compression_params;
+            compression_params.push_back(CV_IMWRITE_JPEG_QUALITY);
+            compression_params.push_back(98);
+            char fname[256];
+            boost::filesystem::path dir(FLAGS_write_frames);
+            if (boost::filesystem::is_directory(dir)) {         
+                static int num = 0;
+                std::cout << frame.video_frame_number << std::endl;
+                // sprintf(fname, "%s/frame%06d.jpg", FLAGS_write_frames.c_str(), frame.video_frame_number);
+                sprintf(fname, "%s/frame%06d.jpg", FLAGS_write_frames.c_str(), num);
+                num++;
+            } else if (!FLAGS_image_dir.empty()) {
+                boost::filesystem::path p(global.image_list[frame.video_frame_number]);
+                std::string rawname = p.stem().string();
+                sprintf(fname, "%s/%s.jpg", FLAGS_image_dir.c_str(), rawname.c_str());
+            } else {
+                LOG(ERROR) << "write dir is configured incorrectly";
+                exit(1);
+            }
+
+            cv::imwrite(fname, wrap_frame, compression_params);
+        }
+
+        if (!FLAGS_write_json.empty()) {
+            double scale = 1.0/frame.scale;
+            const int num_parts = net_copies.at(0).up_model_descriptor->get_number_parts();
+            char fname[256];
+            if (FLAGS_image_dir.empty()) {
+                sprintf(fname, "%s/frame%06d.json", FLAGS_write_json.c_str(), frame.video_frame_number);
+            } else {
+                boost::filesystem::path p(global.image_list[frame.video_frame_number]);
+                std::string rawname = p.stem().string();
+
+                sprintf(fname, "%s/%s.json", FLAGS_write_json.c_str(), rawname.c_str());
+            }
+            std::ofstream fs(fname);
+            fs << "{\n";
+            fs << "\"version\":0.1,\n";
+            fs << "\"bodies\":[\n";
+            for (int ip=0;ip<frame.numPeople;ip++) {
+                fs << "{\n" << "\"joints\":" << "[";
+                for (int ij=0;ij<num_parts;ij++) {
+                    fs << scale*frame.joints[ip*num_parts*3 + ij*3+0] << ",";
+                    fs << scale*frame.joints[ip*num_parts*3 + ij*3+1] << ",";
+                    fs << frame.joints[ip*num_parts*3 + ij*3+2];
+                    if (ij<num_parts-1) fs << ",";
+                }
+                fs << "]\n";
+                fs << "}";
+                if (ip<frame.numPeople-1) {
+                    fs<<",\n";
+                }
+            }
+            fs << "]\n";
+            fs << "}\n";
+            // last_time += get_wall_time()-a;
+        }
+
+
+        counter++;
+
+        if (counter % 30 == 0) {
+            this_time = get_wall_time();
+            FPS = 30.0f / (this_time - last_time);
+            global.uistate.fps = FPS;
+            //LOG(ERROR) << frame.cols << "  " << frame.rows;
+            last_time = this_time;
+            char msg[1000];
+            sprintf(msg, "# %d, NP %d, Latency %.3f, Preprocess %.3f, QueueA %.3f, GPU %.3f, QueueB %.3f, Postproc %.3f, QueueC %.3f, Buffered %.3f, QueueD %.3f, FPS = %.1f",
+                  frame.index, frame.numPeople,
+                  this_time - frame.commit_time,
+                  frame.preprocessed_time - frame.commit_time,
+                  frame.gpu_fetched_time - frame.preprocessed_time,
+                  frame.gpu_computed_time - frame.gpu_fetched_time,
+                  frame.postprocesse_begin_time - frame.gpu_computed_time,
+                  frame.postprocesse_end_time - frame.postprocesse_begin_time,
+                  frame.buffer_start_time - frame.postprocesse_end_time,
+                  frame.buffer_end_time - frame.buffer_start_time,
+                  this_time - frame.buffer_end_time,
+                  FPS);
+            LOG(INFO) << msg;
+        }
+
+        delete [] frame.data_for_mat;
+        delete [] frame.data_for_wrap;
+        delete [] frame.data;
+
+        //LOG(ERROR) << msg;
+        int key = cv::waitKey(1);
+        if (!handleKey(key)) {
+            // TODO: sync issues?
+            break;
+        }
+
+        VLOG(2) << "Display time " << (get_wall_time()-tic)*1000.0 << " ms.";
+    }
+    return nullptr;
+}
+
 int main(int argc, char *argv[]) {
     // Initializing google logging (Caffe uses it as its logging module)
     google::InitGoogleLogging("rtcpm");
@@ -1783,10 +2107,14 @@ int main(int argc, char *argv[]) {
     if (return_value != 0)
         return return_value;
 
-    // Running rtcpm
-    return_value = rtcpm();
-    if (return_value != 0)
-        return return_value;
+    // // Running rtcpm
+    // return_value = rtcpm();
+    // if (return_value != 0)
+    //     return return_value;
+
+    std::cout << "start\n";
+    int arg = 0+FLAGS_start_device;
+    processFrame_2(&arg);
 
     return return_value;
 }
